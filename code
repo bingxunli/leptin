@@ -1,0 +1,181 @@
+library(data.table)
+library(TwoSampleMR)
+library(SNPlocs.Hsapiens.dbSNP155.GRCh37)
+library(SNPlocs.Hsapiens.dbSNP155.GRCh38)
+library(plinkbinr)
+library(ieugwasr)
+library(progress)
+library(tidyverse)
+library(CMplot)
+
+####date source ####
+# decode 
+leptin_decode <- fread('8484_24_LEP_Leptin.txt.gz',data.table = F)
+leptin_decode$Chrom <- sub("^chr", "", leptin_decode$Chrom )
+leptin_decode$phenotype <- 'leptin_decode'
+write.table(leptin_decode, 'leptin_decode.txt', sep='\t', quote=FALSE, row.names=FALSE)
+
+#ukb-ppp
+folder_path <- ("~/leptin/lep_p41159_oid20187_v1_cardiometabolic")
+file_list <- list.files(path = folder_path, pattern = ".gz", full.names = TRUE)
+combined_dt <- data.table()
+for (i in 1:total_files) {
+  file_path <- file_list[i]
+  print(paste("Processing file:", file_path))  # 添加调试信息
+  data <- tryCatch({
+    fread(file_path)
+  }, error = function(e) {
+    message(paste("Error reading file:", file_path))
+    return(NULL)
+  })
+  if (!is.null(data)) {
+    file_name <- tools::file_path_sans_ext(basename(file_path)) 
+    data[, file_column := file_name]
+    combined_dt <- rbindlist(list(combined_dt, data), use.names = TRUE, fill = TRUE)  
+  }
+}
+snps <- SNPlocs.Hsapiens.dbSNP155.GRCh38
+combined_dt$rsid <- NA
+for (i in unique(combined_dt $CHROM)) {
+  my_pos <- combined_dt$GENPOS[combined_dt$CHROM  == i]
+  chr_snps <- snpsBySeqname(snps, as.character(i))
+  idx <- match(my_pos, pos(chr_snps))
+  rsids <- mcols(chr_snps)$RefSNP_id[idx]
+  combined_dt$rsid[combined_dt$CHROM == i] <- rsids
+  print(paste("Chromosome", as.character(i), "is processed"))
+}
+combined_dt$  phenotype <- 'ukbppp_leptin'
+combined_dt <- data.frame(combined_dt)
+combined_dt$Pval <- 10^(-combined_dt$LOG10P)
+write.table(combined_dt, 'ukbppp_leptin.txt', sep='\t', quote=FALSE, row.names=FALSE)
+
+#Yaghootkar PMID:32917775
+leptin_Yaghootkar <- fread('32917775-GCST90007310-EFO_0005000.h.tsv.gz',data.table = F)
+leptin_Yaghootkar$phenotype <- 'leptin_Yaghootkar'
+leptin_Yaghootkar$N <- 49909
+write.table(leptin_Yaghootkar, 'leptin_Yaghootkar.txt', sep='\t', quote=FALSE, row.names=FALSE)
+
+# Folkersen L PMID:33067605
+leptin_Folkersen <- fread('33067605-GCST90012076-EFO_0005000.h.tsv.gz',data.table = F)
+leptin_Folkersen$phenotype <- 'leptin_Folkersen'
+write.table(leptin_Folkersen, 'leptin_Folkersen.txt', sep='\t', quote=FALSE, row.names=FALSE)
+
+#### meta analysis results####
+res=fread('METAANALYSIS2.TBL',data.table = F) 
+head(res)
+#计算beta和se
+res$se <- 1/sqrt(2*res$Freq1*(1-res$Freq1)*(res$Freq1)*(res$Weight+(res$Zscore)^2))
+res$beta <-(res$Zscore)*(res$se)
+# reference: PMID: 27019110
+#标准化列名："SNP"，"beta"，"se"，"eaf"，"effect_allele"，"other_allele"，"p"，"N","HetPVal"
+res = res[,c(1:4,8:10,15:17)]
+colnames(res)
+colnames(res) = c("rsid","effect_allele","other_allele","eaf",'N','Z',"pval",'HetPVal',"se","beta")
+res$effect_allele <- toupper(res$effect_allele)
+res$other_allele <- toupper(res$other_allele)
+res$p <- as.numeric(res$p)
+res$beta <- as.numeric(res$beta)
+res$se <- as.numeric(res$se)
+res$HetPVal <- as.numeric(res$HetPVal)
+res<- res  |> dplyr::filter(eaf >0.01 )
+res<- res  |> dplyr::filter(eaf <1 )
+res <- res[res$chr != "X", ]
+
+# add chr & pos
+decode <- select(leptin_decode, rsid, Chrom, Pos)
+ukb <- select(combined_dt, rsid, CHROM, GENPOS)
+Folkersen <- select(leptin_Folkersen, rsid, chromosome, base_pair_location)
+Yaghootkar <- select(leptin_Yaghootkar, rsid, chromosome, base_pair_location)
+colnames(decode) <- c("rsid", "chr", "pos")
+colnames(ukb) <- c("rsid", "chr", "pos")
+colnames(Folkersen) <- c("rsid", "chr", "pos")
+colnames(Yaghootkar) <- c("rsid", "chr", "pos")
+df1 <- rbind(decode,ukb,Folkersen,Yaghootkar)
+df1 <- df1[!duplicated(df1$rsid),]
+res <- merge(res, df1, by = "rsid")
+
+res_clump <- res|> ieugwasr::ld_clump(res,clump_kb = 10000,
+                                    clump_r2 = 0.001,
+                                    clump_p = 5e-8,
+                                    pop = "EUR",
+                                    bfile = "/home/wasy123/1kgv3/EUR",
+                                    plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux")
+#ukb clump
+colnames(combined_dt)[18] <- 'pval'
+ukbppp_clump <- combined_dt|> ieugwasr::ld_clump(combined_dt,clump_kb = 10000,
+                                     clump_r2 = 0.001,
+                                     clump_p = 5e-8,
+                                     pop = "EUR",
+                                     bfile = "/home/wasy123/1kgv3/EUR",
+                                     plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux")
+#decode clump
+colnames(leptin_decode)[4] <- 'rsid'
+colnames(leptin_decode)[8] <- 'pval'
+leptin_decode_clump <- leptin_decode|> ieugwasr::ld_clump(leptin_decode,clump_kb = 10000,
+                                                 clump_r2 = 0.001,
+                                                 clump_p = 5e-8,
+                                                 pop = "EUR",
+                                                 bfile = "/home/wasy123/1kgv3/EUR",
+                                                 plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux")
+#Folkersen clump
+colnames(leptin_Folkersen)[2] <- 'rsid'
+colnames(leptin_Folkersen)[19] <- 'pval'
+leptin_Folkersen_clump <- leptin_Folkersen|> ieugwasr::ld_clump(leptin_Folkersen,clump_kb = 10000,
+                                                          clump_r2 = 0.001,
+                                                          clump_p = 5e-8,
+                                                          pop = "EUR",
+                                                          bfile = "/home/wasy123/1kgv3/EUR",
+                                                          plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux")
+#Yaghootkar clump
+colnames(leptin_Yaghootkar)[2] <- 'rsid'
+colnames(leptin_Yaghootkar)[20] <- 'pval'
+leptin_Yaghootkar_clump <- leptin_Yaghootkar|> ieugwasr::ld_clump(leptin_Yaghootkar,clump_kb = 10000,
+                                                          clump_r2 = 0.001,
+                                                          clump_p = 5e-8,
+                                                          pop = "EUR",
+                                                          bfile = "/home/wasy123/1kgv3/EUR",
+                                                          plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux")
+#novel loci
+colnames(leptin_decode_clump)[1] <- 'chromosome'
+colnames(leptin_decode_clump)[2] <- 'base_pair_location'
+colnames(ukbppp_clump)[1] <- 'chromosome'
+colnames(ukbppp_clump)[2] <- 'base_pair_location'
+
+orig_loci <- bind_rows(
+  leptin_decode_clump %>% select(rsid, chromosome, base_pair_location),
+  ukbppp_clump %>% select(rsid, chromosome, base_pair_location),
+  leptin_Folkersen_clump %>% select(rsid, chromosome, base_pair_location),
+  leptin_Yaghootkar_clump %>% select(rsid, chromosome, base_pair_location)
+) %>% 
+  distinct(rsid, .keep_all = TRUE)
+
+orig_loci$base_pair_location <- as.numeric(orig_loci$base_pair_location)
+orig_loci$chromosome <- as.numeric(orig_loci$chromosome)
+
+filter_list <- list()
+for (i in 1:nrow(orig_loci)){
+  filter_list[[i]] <- subset(res_clump, chr == orig_loci$chromosome[i] & 
+                               pos >= orig_loci$base_pair_location[i] - 500000 & 
+                               pos <= orig_loci$base_pair_location[i] + 500000)
+}
+filter_list <- do.call(rbind, filter_list) %>% distinct(rsid, .keep_all = TRUE)
+exp_data_filtered <- subset(res_clump, ! rsid %in% filter_list$rsid)
+# Manhattan plots
+set.seed(123)
+res_pval<- res  |> dplyr::filter(pval < 5e-5 )
+res_plot <- rbind(subset(res, rsid %in% res_pval$rsid), res[sample(nrow(res), 100000),])
+res_plot <- res_plot[!duplicated(res_plot$rsid),]
+res_plot <- select(res_plot,rsid,chr,pos,pval)
+CMplot(res_plot,plot.type = "m", threshold = 5e-8, 
+       threshold.col = c("grey","black"),threshold.lty = c(1,2), threshold.lwd = c(1,1),
+       amplify = T, signal.cex = c(1,1), signal.pch = c(20,20), 
+       signal.col = c('#30A9DE','#EFDC05','#E53A40','#090707'), 
+       multracks = F, file.output = F)
+pdf('QQplot.pdf', width = 6, height = 6)
+CMplot(res_plot,plot.type="q",conf.int.col=NULL,box=TRUE,
+       file="pdf",dpi=300,file.output=TRUE,verbose=TRUE)
+dev.off()
+lambda = round(median(res$Z^2) / 0.454, 3)
+lambda
+
+#### SNP_nearest_gene ####
